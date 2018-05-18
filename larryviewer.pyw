@@ -22,7 +22,6 @@ from PySide2.QtUiTools import QUiLoader
 from PySide2.QtCore import Signal, QObject, QSettings, Qt, qFatal, qInstallMessageHandler
 from PySide2.QtGui import QPixmap, QImage, QPalette, QBrush
 from PySide2.QtWidgets import *
-from urllib.request import urlopen
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
@@ -33,6 +32,7 @@ import threading, queue
 import json
 import base64
 import c4group
+import chardet
 import configparser
 import io
 import mistune
@@ -48,6 +48,9 @@ viewer = None
 def loadUi(ui : str, obj=None):
     loader = QUiLoader()
     return loader.load(ui, obj)
+
+def decodeGroupFile(b):
+    return b.decode(chardet.detect(b)["encoding"])
 
 class DummyZipFile(zipfile.ZipFile):
     def __init__(self, fp):
@@ -91,7 +94,7 @@ class PropertyWorker(LarryWorker):
         while True:
             entry = self.larry.queues["desc"].get()
             
-            parser = BeautifulSoup(urlopen(entry.larry["entry_url"]), "lxml")
+            parser = BeautifulSoup(requests.get(entry.larry["entry_url"]), "lxml")
             for row in parser.find_all("tr"):
                 cols = row.find_all("td")
                 try:
@@ -417,7 +420,7 @@ class LarryViewer(QMainWindow):
     
     def fetchCCANList(self):
         if not self.bsobj:
-            self.bsobj = BeautifulSoup(urlopen(CCAN_URL), "lxml")
+            self.bsobj = BeautifulSoup(requests.get(CCAN_URL), "lxml")
         for row in self.bsobj.find_all("tr"):
             try:
                 entry = row.find_all("td")
@@ -524,19 +527,20 @@ class LarryViewer(QMainWindow):
                 realpath = os.path.join(path, i)
                 if not os.path.isfile(realpath):
                     continue
-                grp = c4group.C4GroupDirectory(os.path.join(path, i))
-                grp.load()
-                f = grp.getEntryByName("dependencies.txt")
-                if f:
+                grp = c4group.C4Group()
+                grp.Open(realpath)
+                if grp.AccessEntry("Dependencies.txt"):
                     print("dependencies.txt found")
-                    _checkInEntries(f.toUtf8S(f.content).splitlines())
-                else:
+                    b = bytearray(grp.EntrySize("Dependencies.txt"))
+                    grp.Read(b)
+                    _checkInEntries(b.decode(chardet.detect(b)["encoding"]).splitlines())
+                elif grp.AccessEntry("Scenario.txt"):
                     print("Scenario.txt found")
-                    f = grp.getEntryByName("Scenario.txt")
-                    if f:
-                        c = configparser.ConfigParser()
-                        c.read_string(f.toUtf8S(f.content).replace("\0",""))
-                        _checkInEntries((i[1] for i in c["Definitions"].items() if print(i) or re.match(r"definition*", i[0])))
+                    c = configparser.ConfigParser()
+                    b = bytearray(grp.EntrySize("Scenario.txt"))
+                    grp.Read(b)
+                    c.read_string(decodeGroupFile(b).replace("\0",""))
+                    _checkInEntries((i[1] for i in c["Definitions"].items() if print(i) or re.match(r"definition*", i[0])))
             self.queues["download"].join()
             self.signal_finished.disconnect(self.resolveDependenciesAfterInstallation)
             self.signal_finished.connect(self.downloadFinished)
@@ -598,7 +602,7 @@ class LarryViewer(QMainWindow):
         self.ui.btnDownload.setEnabled(True)
 
     def searchTextChanged(self, text : str):
-        for i in range(self.lsEntries.count()):
+        for i in range(self.ui.lsEntries.count()):
             self.ui.lsEntries.item(i).setHidden(text not in self.ui.lsEntries.item(i).text())
     
     def cycle(self) -> None:
