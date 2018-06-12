@@ -18,10 +18,16 @@
 import os, re
 sys = os.sys
 
-from PySide2.QtUiTools import QUiLoader
-from PySide2.QtCore import Signal, QObject, QSettings, Qt, qFatal, qInstallMessageHandler
-from PySide2.QtGui import QPixmap, QImage, QPalette, QBrush
-from PySide2.QtWidgets import *
+try:
+    raise ModuleNotFoundError
+    from PySide2.QtUiTools import QUiLoader
+    from PySide2.QtCore import Signal, QObject, QSettings, Qt, qFatal, qInstallMessageHandler
+    from PySide2.QtGui import QPixmap, QImage, QPalette, QBrush
+    from PySide2.QtWidgets import *
+    HAVE_QT = True
+except ModuleNotFoundError:
+    HAVE_QT = False
+
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
@@ -31,11 +37,16 @@ import traceback
 import threading, queue
 import json
 import base64
-import c4group
+if HAVE_QT:
+    import c4group
 import chardet
 import configparser
 import io
-import mistune
+try:
+    import mistune
+    HAVE_MISTUNE = True
+except ModuleNotFoundError:
+    HAVE_MISTUNE = False
 
 LARRY_API = "https://larry-api.asw.io"
 #LARRY_API = "http://127.0.0.1:8080"
@@ -45,9 +56,16 @@ lock = threading.Lock()
 
 viewer = None
 
-def loadUi(ui : str, obj=None):
-    loader = QUiLoader()
-    return loader.load(ui, obj)
+if HAVE_QT:
+    def loadUi(ui : str, obj=None):
+        loader = QUiLoader()
+        return loader.load(ui, obj)
+else:
+    class QListWidgetItem(object):
+        def __init__(self, *args):
+            pass
+    
+    QMainWindow = object
 
 def decodeGroupFile(b):
     return b.decode(chardet.detect(b)["encoding"])
@@ -79,7 +97,8 @@ class DownloadWorker(LarryWorker):
             l = self.larry.queues["download"].get() # [Entry, str]
             print(l)
             try:
-                self.larry.dlgProgress.setLabelText(f"Lade {l[0].title} herunter...")
+                if HAVE_QT:
+                    self.larry.dlgProgress.setLabelText(f"Lade {l[0].title} herunter...")
                 l[0].download(l[1])
             except Exception as e:
                 print(e)
@@ -100,7 +119,8 @@ class PropertyWorker(LarryWorker):
                 try:
                     if cols[0].text in ["Beschreibung:", "Description:"]:
                         entry.larry.description = str(cols[1])
-                        self.larry.descLoaded.emit(entry, entry)
+                        if HAVE_QT:
+                            self.larry.descLoaded.emit(entry, entry)
                         break
                 except IndexError:
                     continue
@@ -110,13 +130,12 @@ class ImageWorker(LarryWorker):
     def run(self):
         while True:
             entry = self.larry.queues["image"].get()
-            #if not entry.larry.picture and entry.larry.ids["picture"]:
+            ## if not entry.larry.picture and entry.larry.ids["picture"]:
             #    r = requests.get(f"{LARRY_API}/media/{str(entry.larry.ids['picture'])}")
             self.larry.queues["image"].task_done()
             
-            
 
-class Entry(QObject):
+class Entry(object):
     title = ""
     author = ""
     download_url = ""
@@ -133,7 +152,7 @@ class Entry(QObject):
         "picture" : None
         }
     _files = None
-    
+    _size = None
     picture = None
     _version = ""
     
@@ -179,6 +198,14 @@ class Entry(QObject):
         
         return self._files
     
+    def size(self):
+        if self._size is None:
+            for i in self.ids["file"]:
+                r = requests.get(LARRY_API + "/media/" + str(i), params={"download" : 1}, stream=True)
+                if r:
+                    self._size = int(r.headers.get("Content-Length", 0)) or None
+        return self._size
+    
     def __getitem__(self, item):
         return getattr(self, item)
     
@@ -196,7 +223,6 @@ class Entry(QObject):
         return s
     
     def __setstate__(self, s):
-        QObject.__init__(self)
         for i in s["ids"]:
             if i == "file":
                 try:
@@ -238,7 +264,7 @@ class CCANEntry(Entry):
     _buffer = None
     
     def __init__(self, *args, **kwargs):
-        super(CCANEntry, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self._buffer = io.BytesIO()
     
     def __getstate__(self):
@@ -342,6 +368,15 @@ class CCANEntry(Entry):
             else:
                 self._files = [filename]
         return self._files
+    
+    def size(self):
+        if self._size is None:
+            r = requests.head(self.download_url)
+            if r and "Location" in r.headers:
+                r = requests.head(r.headers["Location"])
+                self._size = int(r.headers.get("Content-Length", 0)) or None
+        
+        return self._size
 
 class LarryViewer(QMainWindow):
     bsobj = None
@@ -357,18 +392,16 @@ class LarryViewer(QMainWindow):
     dlgSettings = None
     parser = None
     
-    descLoaded = Signal(QListWidgetItem, QListWidgetItem, name="descLoaded")
-    signal_error = Signal(str)
-    signal_finished = Signal(Entry, str)
+    if HAVE_QT:
+        descLoaded = Signal(QListWidgetItem, QListWidgetItem, name="descLoaded")
+        signal_error = Signal(str)
+        signal_finished = Signal(Entry, str)
     
     def __init__(self, bsobj : BeautifulSoup = None):
         super().__init__()
-        self.parser = mistune.Markdown()
-        self.config = QSettings()
+        self.parser = mistune.Markdown() if HAVE_MISTUNE else lambda x: x
         self.bsobj = bsobj
-        self.dlgProgress = QProgressDialog()
-        self.dlgProgress.setCancelButton(None)
-        self.dlgProgress.reset()
+        
         self.threads = list()
         self.errors = list()
         self.queues = {
@@ -382,51 +415,65 @@ class LarryViewer(QMainWindow):
             PropertyWorker(larry=self).start()
             #ImageWorker(larry=self).start()
         
-        self.ui = loadUi("main.ui", self)
-        self.dlgSettings = loadUi("settings.ui")
-        
-        # Main
-        self.ui.actAboutQt.triggered.connect(QApplication.aboutQt)
-        self.ui.lsEntries.currentItemChanged.connect(self.listItemChanged)
-        self.ui.lsEntries.itemDoubleClicked.connect(self.cycle)
-        self.ui.btnDownload.clicked.connect(self.download)
-        self.ui.txtSearch.textChanged.connect(self.searchTextChanged)
-        self.descLoaded.connect(self.listItemChanged)
-        self.signal_error.connect(self.downloadError)
-        self.signal_finished.connect(self.downloadFinished)
-
-        # Settings
-        self.dlgSettings.hide()
-        self.dlgSettings.lblCRDir.setText(self.config.value("CR/directory") or self.tr("Nicht festgelegt"))
-        self.dlgSettings.lblOCDir.setText(self.config.value("OC/directory") or self.tr("Nicht festgelegt"))
-        self.ui.actSettings.triggered.connect(self.dlgSettings.show)
-        self.dlgSettings.btnCRDir.clicked.connect(self.setClonkDir)
-        self.dlgSettings.btnOCDir.clicked.connect(self.setClonkDir)
-        self.dlgSettings.btnFinished.clicked.connect(self.dlgSettings.hide)
-        
-        # Larry uploader
-        self.uploader = LarryUploader(self)
-        self.uploader.ui.hide()
-        self.ui.actUpload.triggered.connect(self.uploader.ui.show)
-        
         threading.Thread(target=self.fetchCCANList, name="ccanlist", daemon=True).start() # WARNING: Don't call this before UI initialization, otherwise the application may fail
         threading.Thread(target=self.fetchLarryList, name="larrylist", daemon=True).start()
-    
-    def itemEqual(self, b):
-        assert isinstance(self, QListWidgetItem)
-        if not b:
-            return
-        return b.larry == self.larry
-    
+        
+        
+        if HAVE_QT:
+            self.config = QSettings()
+            self.dlgProgress = QProgressDialog()
+            self.dlgProgress.setCancelButton(None)
+            self.dlgProgress.reset()
+        
+            self.ui = loadUi("main.ui", self)
+            self.dlgSettings = loadUi("settings.ui")
+            
+            # Main
+            self.ui.actAboutQt.triggered.connect(QApplication.aboutQt)
+            self.ui.lsEntries.currentItemChanged.connect(self.listItemChanged)
+            self.ui.lsEntries.itemDoubleClicked.connect(self.cycle)
+            self.ui.btnDownload.clicked.connect(self.download)
+            self.ui.txtSearch.textChanged.connect(self.searchTextChanged)
+            self.descLoaded.connect(self.listItemChanged)
+            self.signal_error.connect(self.downloadError)
+            self.signal_finished.connect(self.downloadFinished)
+
+            # Settings
+            self.dlgSettings.hide()
+            self.dlgSettings.lblCRDir.setText(self.config.value("CR/directory") or self.tr("Nicht festgelegt"))
+            self.dlgSettings.lblOCDir.setText(self.config.value("OC/directory") or self.tr("Nicht festgelegt"))
+            self.ui.actSettings.triggered.connect(self.dlgSettings.show)
+            self.dlgSettings.btnCRDir.clicked.connect(self.setClonkDir)
+            self.dlgSettings.btnOCDir.clicked.connect(self.setClonkDir)
+            self.dlgSettings.btnFinished.clicked.connect(self.dlgSettings.hide)
+            
+            # Larry uploader
+            self.uploader = LarryUploader(self)
+            self.uploader.ui.hide()
+            self.ui.actUpload.triggered.connect(self.uploader.ui.show)
+        else:
+            class PseudoUI(object):
+                class PseudoQListWidget(list):
+                    def item(self, i):
+                        return self[i]
+                    
+                    def count(self):
+                        return len(self)
+                    
+                    def addItem(self, item):
+                        self.append(item)
+                
+                lsEntries = PseudoQListWidget()
+            self.ui = PseudoUI()
+            
     def fetchCCANList(self):
         if not self.bsobj:
-            self.bsobj = BeautifulSoup(requests.get(CCAN_URL), "lxml")
+            self.bsobj = BeautifulSoup(requests.get(CCAN_URL).text, "lxml")
         for row in self.bsobj.find_all("tr"):
             try:
                 entry = row.find_all("td")
                 upload = {}
                 item = QListWidgetItem(entry[1].text)
-                item.__eq__ = self.itemEqual
                 item.larry = CCANEntry()
                 item.larry.title = entry[1].text
                 item.larry._version = "v" + entry[1].text.partition(" v")[-1]
@@ -456,7 +503,6 @@ class LarryViewer(QMainWindow):
                 continue
             
             item = QListWidgetItem(upload["title"])
-            item.__eq__ = self.itemEqual
             item.larry = Entry.fromUpload(upload)
             
             #font = item.font()
@@ -470,331 +516,348 @@ class LarryViewer(QMainWindow):
             self.fetchCCANList()
         self.ui.lsEntries.clear()
         threading.Thread(target=_reload, daemon=True).start()
+    
+    if HAVE_QT:
+        def displayMessageBox(self, text : str, title : str = "LarryViewer", icon = QMessageBox.Information):
+            box = QMessageBox()
+            box.setWindowTitle(self.tr(title))
+            box.setText(self.tr(text))
+            box.setIcon(icon)
+            box.exec()
 
-    def displayMessageBox(self, text : str, title : str = "LarryViewer", icon = QMessageBox.Information):
-        box = QMessageBox()
-        box.setWindowTitle(self.tr(title))
-        box.setText(self.tr(text))
-        box.setIcon(icon)
-        box.exec()
-
-    def displayErrorBox(self, text : str, title : str = "Fehler"):
-        return self.displayMessageBox(text, title, QMessageBox.Critical)
+        def displayErrorBox(self, text : str, title : str = "Fehler"):
+            return self.displayMessageBox(text, title, QMessageBox.Critical)
+    else:
+        def displayMessageBox(self, *args):
+            pass
+        
+        def displayErrorBox(self, *args):
+            pass
     
     def validatePath(self, path):
         if os.path.exists(path) and not os.path.isfile(path):
-            self.displayErrorBox("Kann \"{}\" nicht überschreiben.".format(path))
+            if HAVE_QT:
+                self.displayErrorBox("Kann \"{}\" nicht überschreiben.".format(path))
             return
         return path
-
-    def listItemChanged(self, current : QListWidgetItem, previous : QListWidgetItem):
-        if not current:
-            return
-        
-        self.ui.lblTitle.setText(current.text())
-        self.ui.lblAuthor.setText(current.larry.author)
-        
-        if current.larry.description:
-            self.ui.txtDescription.setHtml(self.parser(current.larry.description))
-        else:
-            self.ui.txtDescription.setHtml(self.tr("Lade..."))
-            self.queues["desc"].put(current)
-        
-        #if current.larry.ids.get("picture"):
-            #if current.larry.picture:
-                #self.txtDescription.setStyleSheet(s)
-            #else:
-                #self.queues["image"].put(current)
     
-    def resolveDependenciesAfterInstallation(self, item : Entry, path : str):
-        def _checkInEntries(iterable):
-            #print(list(iterable))
-            for l in iterable:
-                if not os.path.exists(os.path.join(path, l)):
-                    print(f"{l} doesn't exist")
-                    for i in range(self.ui.lsEntries.count()):
-                        if l in self.ui.lsEntries.item(i).larry.files():
-                            print(f"Found")
-                            self.setLabelText(f"Füge Abhängigkeit hinzu: {self.ui.lsEntries.item(i).text()}")
-                            self.queues["download"].put((self.ui.lsEntries.item(i).larry, path))
-                            break
-        
-        def _add_dependencies(item : Entry):
-            # If we're called, there are no dependencies specified or it is a CCAN entry
-            # First: check for dependencies.txt in one of the files
-            self.dlgProgress.setLabelText("Löse Abhängigkeiten auf...")
-            for i in item.files():
-                realpath = os.path.join(path, i)
-                if not os.path.isfile(realpath):
-                    continue
-                grp = c4group.C4Group()
-                grp.Open(realpath)
-                if grp.AccessEntry("Dependencies.txt"):
-                    print("dependencies.txt found")
-                    b = bytearray(grp.EntrySize("Dependencies.txt"))
-                    grp.Read(b)
-                    _checkInEntries(b.decode(chardet.detect(b)["encoding"]).splitlines())
-                elif grp.AccessEntry("Scenario.txt"):
-                    print("Scenario.txt found")
-                    c = configparser.ConfigParser()
-                    b = bytearray(grp.EntrySize("Scenario.txt"))
-                    grp.Read(b)
-                    c.read_string(decodeGroupFile(b).replace("\0",""))
-                    _checkInEntries((i[1] for i in c["Definitions"].items() if print(i) or re.match(r"definition*", i[0])))
-            self.queues["download"].join()
-            self.signal_finished.disconnect(self.resolveDependenciesAfterInstallation)
-            self.signal_finished.connect(self.downloadFinished)
-            self.signal_finished.emit(item, path)
-
-        assert item.files(), f"{item.files()}"
-        threading.Thread(target=_add_dependencies, daemon=True, args=(item,)).start()
-    
-    def resolveDependencies(self, item : Entry, path : str):
-        # First step: check for dependency array
-        self.dlgProgress.setLabelText("Löse Abhängigkeiten auf...")
-        if item.dependencies:
-            def _add_dependencies(item : Entry, path : str):
-                if item.dependencies:
-                    for d in item.dependencies:
-                        for i in range(self.ui.lsEntries.count()):
-                            if self.ui.lsEntries.item(i).larry.ids["upload"] == d and d not in self.queues["download"].queue:
-                                self.dlgProgress.setLabelText(f"Füge Abhängigkeit hinzu: {self.ui.lsEntries.item(i).text()}")
-                                _add_dependencies(self.ui.lsEntries.item(i).larry)
-                self.queues["download"].put((item, path))
+    if HAVE_QT:
+        def listItemChanged(self, current : QListWidgetItem, previous : QListWidgetItem):
+            if not current:
+                return
             
-            _add_dependencies(item, path)
-            return
-        else:
-            self.queues["download"].put((item, path))
-            self.signal_finished.disconnect(self.downloadFinished)
-            self.signal_finished.connect(self.resolveDependenciesAfterInstallation)
+            self.ui.lblTitle.setText(current.text())
+            self.ui.lblAuthor.setText(current.larry.author)
+            
+            if current.larry.description:
+                self.ui.txtDescription.setHtml(self.parser(current.larry.description))
+            else:
+                self.ui.txtDescription.setHtml(self.tr("Lade..."))
+                self.queues["desc"].put(current)
+            
+            ## if current.larry.ids.get("picture"):
+                ## if current.larry.picture:
+                    #self.txtDescription.setStyleSheet(s)
+                #else:
+                    #self.queues["image"].put(current)
+    
+        def resolveDependenciesAfterInstallation(self, item : Entry, path : str):
+            def _checkInEntries(iterable):
+                #print(list(iterable))
+                for l in iterable:
+                    if not os.path.exists(os.path.join(path, l)):
+                        print(f"{l} doesn't exist")
+                        for i in range(self.ui.lsEntries.count()):
+                            if l in self.ui.lsEntries.item(i).larry.files():
+                                print(f"Found")
+                                self.setLabelText(f"Füge Abhängigkeit hinzu: {self.ui.lsEntries.item(i).text()}")
+                                self.queues["download"].put((self.ui.lsEntries.item(i).larry, path))
+                                break
+            
+            def _add_dependencies(item : Entry):
+                # If we're called, there are no dependencies specified or it is a CCAN entry
+                # First: check for dependencies.txt in one of the files
+                self.dlgProgress.setLabelText("Löse Abhängigkeiten auf...")
+                for i in item.files():
+                    realpath = os.path.join(path, i)
+                    if not os.path.isfile(realpath):
+                        continue
+                    grp = c4group.C4Group()
+                    grp.Open(realpath)
+                    if grp.AccessEntry("Dependencies.txt"):
+                        print("dependencies.txt found")
+                        b = bytearray(grp.EntrySize("Dependencies.txt"))
+                        grp.Read(b)
+                        _checkInEntries(b.decode(chardet.detect(b)["encoding"]).splitlines())
+                    elif grp.AccessEntry("Scenario.txt"):
+                        print("Scenario.txt found")
+                        c = configparser.ConfigParser()
+                        b = bytearray(grp.EntrySize("Scenario.txt"))
+                        grp.Read(b)
+                        c.read_string(decodeGroupFile(b).replace("\0",""))
+                        _checkInEntries((i[1] for i in c["Definitions"].items() if print(i) or re.match(r"definition*", i[0])))
+                self.queues["download"].join()
+                self.signal_finished.disconnect(self.resolveDependenciesAfterInstallation)
+                self.signal_finished.connect(self.downloadFinished)
+                self.signal_finished.emit(item, path)
+
+            assert item.files(), f"{item.files()}"
+            threading.Thread(target=_add_dependencies, daemon=True, args=(item,)).start()
+    
+        def resolveDependencies(self, item : Entry, path : str):
+            # First step: check for dependency array
+            self.dlgProgress.setLabelText("Löse Abhängigkeiten auf...")
+            if item.dependencies:
+                def _add_dependencies(item : Entry, path : str):
+                    if item.dependencies:
+                        for d in item.dependencies:
+                            for i in range(self.ui.lsEntries.count()):
+                                if self.ui.lsEntries.item(i).larry.ids["upload"] == d and d not in self.queues["download"].queue:
+                                    self.dlgProgress.setLabelText(f"Füge Abhängigkeit hinzu: {self.ui.lsEntries.item(i).text()}")
+                                    _add_dependencies(self.ui.lsEntries.item(i).larry)
+                    self.queues["download"].put((item, path))
+                
+                _add_dependencies(item, path)
+                return
+            else:
+                self.queues["download"].put((item, path))
+                self.signal_finished.disconnect(self.downloadFinished)
+                self.signal_finished.connect(self.resolveDependenciesAfterInstallation)
     
     def download(self, sel : QListWidgetItem = None):
         def _download(item : QListWidgetItem, path : str):
-            self.resolveDependencies(item.larry, path)
+            if HAVE_QT:
+                self.resolveDependencies(item.larry, path)
             self.queues["download"].join()
             if self.errors:
                 e = "\n".join(str(i) for i in self.errors)
                 self.errors = list()
-                self.signal_error.emit(e)
+                if HAVE_QT:
+                    self.signal_error.emit(e)
             else:
-                self.signal_finished.emit(item.larry, path)
+                if HAVE_QT:
+                    self.signal_finished.emit(item.larry, path)
         
-        sel = sel or self.ui.lsEntries.currentItem()
+        sel = sel or not HAVE_QT or self.ui.lsEntries.currentItem()
         if not sel:
             return
         v = sel.larry.clonkVersion()
         if not self.config.value(f"{v}/directory"):
             return self.displayErrorBox("Kein Clonk-Verzeichnis angegeben!")
         
-        self.sender().setEnabled(False)
-        self.dlgProgress.open()
-        thread = threading.Thread(target=_download, args=(sel, self.config.value(f"{v}/directory")))
+        if HAVE_QT:
+            self.sender().setEnabled(False)
+            self.dlgProgress.open()
+            thread = threading.Thread(target=_download, args=(sel, self.config.value(f"{v}/directory")))
         thread.start()
+    
+    if HAVE_QT:
+        def downloadError(self, e : str):
+            self.displayErrorBox(f"Fehler beim Download: {e}")
+            self.ui.btnDownload.setEnabled(True)
 
-    def downloadError(self, e : str):
-        self.displayErrorBox(f"Fehler beim Download: {e}")
-        self.ui.btnDownload.setEnabled(True)
+        def downloadFinished(self):
+            self.dlgProgress.reset()
+            self.displayMessageBox("Download erfolgreich!")
+            self.ui.btnDownload.setEnabled(True)
 
-    def downloadFinished(self):
-        self.dlgProgress.reset()
-        self.displayMessageBox("Download erfolgreich!")
-        self.ui.btnDownload.setEnabled(True)
+        def searchTextChanged(self, text : str):
+            for i in range(self.ui.lsEntries.count()):
+                self.ui.lsEntries.item(i).setHidden(text not in self.ui.lsEntries.item(i).text())
+        
+        def cycle(self) -> None:
+            print("fired")
+            i = self.ui.mainStack.currentIndex()
+            self.ui.mainStack.setCurrentIndex(i + 1 if i + 1 < self.ui.mainStack.count() else 0)
+        
+        # Settings
 
-    def searchTextChanged(self, text : str):
-        for i in range(self.ui.lsEntries.count()):
-            self.ui.lsEntries.item(i).setHidden(text not in self.ui.lsEntries.item(i).text())
-    
-    def cycle(self) -> None:
-        print("fired")
-        i = self.ui.mainStack.currentIndex()
-        self.ui.mainStack.setCurrentIndex(i + 1 if i + 1 < self.ui.mainStack.count() else 0)
-    
-    # Settings
+        def setClonkDir(self):
+            f = QFileDialog.getExistingDirectory(self, self.tr("Verzeichnis auswählen"), os.getcwd())
+            if f != "":
+                v = self.sender().objectName()[3:5]
+                self.config.setValue(f"{v}/directory", f)
+                getattr(self.dlgSettings, f"lbl{v}Dir").setText(f)
 
-    def setClonkDir(self):
-        f = QFileDialog.getExistingDirectory(self, self.tr("Verzeichnis auswählen"), os.getcwd())
-        if f != "":
-            v = self.sender().objectName()[3:5]
-            self.config.setValue(f"{v}/directory", f)
-            getattr(self.dlgSettings, f"lbl{v}Dir").setText(f)
-
-class LarryUploader(QDialog):
-    credentials = {
-        "username" : "",
-        "email" : "",
-        "password" : "",
-        "token" : ""
-        }
-    ui = None
-    current_upload = None
-    
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.ui = loadUi("larry_uploader.ui", self)
-        
-        self.ui.imgScene = QGraphicsScene()
-        self.ui.pctImage = QGraphicsView(self.ui.imgScene)
-        self.ui.pctImage.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.ui.pctImage.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.ui.layImage.addWidget(self.ui.pctImage)
-        
-        self.ui.btnAdvance.clicked.connect(self.advance)
-        self.ui.btnBack.clicked.connect(self.back)
-        self.ui.btnBack.setEnabled(False)
-        
-        self.ui.tabs.setCurrentIndex(0)
-        
-        self.ui.btnChooseImage.clicked.connect(self.chooseImage)
-        self.ui.btnChooseFiles.clicked.connect(self.chooseFiles)
-    
-    def rejectTabChange(self, index : int):
-        if index == 0:
-            email, password = self.ui.txtEmail.text(), self.ui.txtPassword.text()
-            r = requests.post(LARRY_API + "/auth/login",
-                          headers={"Content-Type" : "application/json"},
-                          data=json.dumps({"user" : {"email" : email, "password" : password}})
-                          )
-            if r:
-                
-                user = r.json()["user"]
-                self.credentials["username"] = user["username"]
-                self.credentials["email"] = user["email"]
-                self.credentials["token"] = user["token"]
-                self.credentials["password"] = password
-                return
-            else:
-                return self.tr("Benutzername und / oder Passwort inkorrekt.")
-        
-        elif index == 1:
-            title, desc = self.ui.txtTitle.text(), self.ui.txtDescription.toPlainText()
-            if not title:
-                return "Titel fehlt."
-            if not desc:
-                return "Beschreibung fehlt."
-            
-            if [i for i in range(self.parent().ui.lsEntries.count()) if self.parent().ui.lsEntries.item(i).larry.title == title]:
-                return "Es gibt bereits einen Eintrag mit diesem Titel."
-            
-            if not self.current_upload:
-                self.current_upload = Entry()
-            
-            self.current_upload.title = title
-            self.current_upload.author = self.credentials["username"]
-            self.current_upload.description = desc
-            return
-            
-        elif index == 2:
-            if not getattr(self.current_upload, "files", None):
-                return "Mindestens eine Datei muss hochgeladen werden."
-            return
-        
-        elif index == 3:
-            if self.ui.chkAccepted.checkState() != Qt.Checked:
-                return "Sie müssen den genannten Bedingungen zustimmen."
-            if not self.upload():
-                return
-            
-            self.parent().reloadList()
-            self.hide()
-            return
-        
-        else:
-            return " "
-    
-    def advance(self):
-        self.changeTab(+1)
-    
-    def back(self):
-        self.changeTab(-1)
-    
-    def changeTab(self, offset):
-        if offset > 0:
-            self.ui.btnAdvance.setEnabled(False)
-            self.ui.btnBack.setEnabled(False)
-            txt = self.rejectTabChange(self.ui.tabs.currentIndex())
-            self.ui.btnAdvance.setEnabled(True)
-            self.ui.btnBack.setEnabled(True)
-            if txt:
-                LarryViewer.displayMessageBox(self, txt, "Fehler", QMessageBox.Critical)
-                return
-        next = self.ui.tabs.currentIndex() + offset
-        
-        self.ui.btnAdvance.setText(self.tr("Weiter"))
-        if next == 0:
-            self.ui.btnBack.setEnabled(False)
-        elif next == self.ui.tabs.count() - 1:
-            self.ui.btnAdvance.setText(self.tr("Fertigstellen"))
-        
-        self.ui.tabs.setCurrentIndex(self.ui.tabs.currentIndex() + offset)
-    
-    def chooseImage(self):
-        # WARNING: Misusing Entry.picture_url to store a path
-        self.current_upload.filename = QFileDialog.getOpenFileName(self, self.tr("Wähle die Bilddatei"), os.getcwd(), self.tr("Images (*.png *.jpg *.jpeg)"))[0]
-        self.updateImage(self.current_upload.filename)
-    
-    def updateImage(self, f : str):
-        self.ui.imgScene.clear()
-        img = QImage(f).scaled(self.pctImage.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        pixmap = QGraphicsPixmapItem(QPixmap.fromImage(img))
-        self.ui.imgScene.addItem(pixmap)
-        self.ui.pctImage.update()
-    
-    def chooseFiles(self):
-        # WARNING: Misusing Entry.ids["file"] to store file paths
-        files = QFileDialog.getOpenFileNames(self, self.tr("Wähle die Dateien"), os.getcwd(), self.tr("Clonk Files (*.c4d *.c4f *.c4b *.c4r *.c4s *.c4m *.c4g *.ocd *.ocf *.ocb *.ocr *.ocs *ocm"))[0]
-        for f in files:
-            self.ui.lsFiles.addItem(QListWidgetItem(f))
-        
-        self.current_upload.files = files 
-    
-    def upload(self):
-        def uploadFile(f):
-            with open(f, "rb") as fobj:
-                r = requests.post(LARRY_API + "/media",
-                                headers = {
-                                    #"Content-Type" : "multipart/form-data",
-                                    "Authorization" : f"Bearer {self.credentials['token']}",
-                                    "Accept" : "application/json"
-                                        },
-                                files = {"media" : fobj}
-                                )
-                if r:
-                    return r.json()["_id"]
-        
-        self.current_upload.date = datetime.now()
-        self.current_upload.slug = self.current_upload.title.replace(" ", "_").encode("ascii", "ignore").decode("ascii")
-        
-        [self.current_upload.ids["file"].append(uploadFile(i)) for i in self.current_upload.files]
-        
-        if self.current_upload.picture_url:
-            self.current_upload.ids["picture"] = uploadFile(self.current_upload.picture_url)
-        
-        data = {
-            "upload" : {
-                "title" : self.current_upload.title,
-                "slug" : self.current_upload.slug,
-                "description" : self.current_upload.description,
-                "tag" : ["LarryViewer"],
-                "files" : [i for i in self.current_upload.ids["file"] if i is not None]
-                }
+if HAVE_QT:
+    class LarryUploader(QDialog):
+        credentials = {
+            "username" : "",
+            "email" : "",
+            "password" : "",
+            "token" : ""
             }
+        ui = None
+        current_upload = None
         
-        if self.current_upload.ids["picture"]:
-            data["pic"] = self.current_upload.ids["picture"]
+        def __init__(self, parent):
+            super().__init__(parent)
+            self.ui = loadUi("larry_uploader.ui", self)
+            
+            self.ui.imgScene = QGraphicsScene()
+            self.ui.pctImage = QGraphicsView(self.ui.imgScene)
+            self.ui.pctImage.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self.ui.pctImage.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self.ui.layImage.addWidget(self.ui.pctImage)
+            
+            self.ui.btnAdvance.clicked.connect(self.advance)
+            self.ui.btnBack.clicked.connect(self.back)
+            self.ui.btnBack.setEnabled(False)
+            
+            self.ui.tabs.setCurrentIndex(0)
+            
+            self.ui.btnChooseImage.clicked.connect(self.chooseImage)
+            self.ui.btnChooseFiles.clicked.connect(self.chooseFiles)
         
-        r = requests.post(LARRY_API + "/uploads",
-                          headers = {"Content-Type" : "application/json", "Authorization": f"Bearer {self.credentials['token']}"},
-                          data = json.dumps(data))
+        def rejectTabChange(self, index : int):
+            if index == 0:
+                email, password = self.ui.txtEmail.text(), self.ui.txtPassword.text()
+                r = requests.post(LARRY_API + "/auth/login",
+                            headers={"Content-Type" : "application/json"},
+                            data=json.dumps({"user" : {"email" : email, "password" : password}})
+                            )
+                if r:
+                    
+                    user = r.json()["user"]
+                    self.credentials["username"] = user["username"]
+                    self.credentials["email"] = user["email"]
+                    self.credentials["token"] = user["token"]
+                    self.credentials["password"] = password
+                    return
+                else:
+                    return self.tr("Benutzername und / oder Passwort inkorrekt.")
+            
+            elif index == 1:
+                title, desc = self.ui.txtTitle.text(), self.ui.txtDescription.toPlainText()
+                if not title:
+                    return "Titel fehlt."
+                if not desc:
+                    return "Beschreibung fehlt."
+                
+                if [i for i in range(self.parent().ui.lsEntries.count()) if self.parent().ui.lsEntries.item(i).larry.title == title]:
+                    return "Es gibt bereits einen Eintrag mit diesem Titel."
+                
+                if not self.current_upload:
+                    self.current_upload = Entry()
+                
+                self.current_upload.title = title
+                self.current_upload.author = self.credentials["username"]
+                self.current_upload.description = desc
+                return
+                
+            elif index == 2:
+                if not getattr(self.current_upload, "files", None):
+                    return "Mindestens eine Datei muss hochgeladen werden."
+                return
+            
+            elif index == 3:
+                if self.ui.chkAccepted.checkState() != Qt.Checked:
+                    return "Sie müssen den genannten Bedingungen zustimmen."
+                if not self.upload():
+                    return
+                
+                self.parent().reloadList()
+                self.hide()
+                return
+            
+            else:
+                return " "
         
-        if r:
-            LarryViewer.displayMessageBox(self, "Upload erfolgreich!", "Upload")
-            return True
-        else:
-            LarryViewer.displayMessageBox(self, "Upload fehlgeschlagen!", "Fehler", QMessageBox.Critical)
-            return False
+        def advance(self):
+            self.changeTab(+1)
+        
+        def back(self):
+            self.changeTab(-1)
+        
+        def changeTab(self, offset):
+            if offset > 0:
+                self.ui.btnAdvance.setEnabled(False)
+                self.ui.btnBack.setEnabled(False)
+                txt = self.rejectTabChange(self.ui.tabs.currentIndex())
+                self.ui.btnAdvance.setEnabled(True)
+                self.ui.btnBack.setEnabled(True)
+                if txt:
+                    LarryViewer.displayMessageBox(self, txt, "Fehler", QMessageBox.Critical)
+                    return
+            next = self.ui.tabs.currentIndex() + offset
+            
+            self.ui.btnAdvance.setText(self.tr("Weiter"))
+            if next == 0:
+                self.ui.btnBack.setEnabled(False)
+            elif next == self.ui.tabs.count() - 1:
+                self.ui.btnAdvance.setText(self.tr("Fertigstellen"))
+            
+            self.ui.tabs.setCurrentIndex(self.ui.tabs.currentIndex() + offset)
+        
+        def chooseImage(self):
+            # WARNING: Misusing Entry.picture_url to store a path
+            self.current_upload.filename = QFileDialog.getOpenFileName(self, self.tr("Wähle die Bilddatei"), os.getcwd(), self.tr("Images (*.png *.jpg *.jpeg)"))[0]
+            self.updateImage(self.current_upload.filename)
+        
+        def updateImage(self, f : str):
+            self.ui.imgScene.clear()
+            img = QImage(f).scaled(self.pctImage.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            pixmap = QGraphicsPixmapItem(QPixmap.fromImage(img))
+            self.ui.imgScene.addItem(pixmap)
+            self.ui.pctImage.update()
+        
+        def chooseFiles(self):
+            # WARNING: Misusing Entry.ids["file"] to store file paths
+            files = QFileDialog.getOpenFileNames(self, self.tr("Wähle die Dateien"), os.getcwd(), self.tr("Clonk Files (*.c4d *.c4f *.c4b *.c4r *.c4s *.c4m *.c4g *.ocd *.ocf *.ocb *.ocr *.ocs *ocm"))[0]
+            for f in files:
+                self.ui.lsFiles.addItem(QListWidgetItem(f))
+            
+            self.current_upload.files = files 
+        
+        def upload(self):
+            def uploadFile(f):
+                with open(f, "rb") as fobj:
+                    r = requests.post(LARRY_API + "/media",
+                                    headers = {
+                                        #"Content-Type" : "multipart/form-data",
+                                        "Authorization" : f"Bearer {self.credentials['token']}",
+                                        "Accept" : "application/json"
+                                            },
+                                    files = {"media" : fobj}
+                                    )
+                    if r:
+                        return r.json()["_id"]
+            
+            self.current_upload.date = datetime.now()
+            self.current_upload.slug = self.current_upload.title.replace(" ", "_").encode("ascii", "ignore").decode("ascii")
+            
+            [self.current_upload.ids["file"].append(uploadFile(i)) for i in self.current_upload.files]
+            
+            if self.current_upload.picture_url:
+                self.current_upload.ids["picture"] = uploadFile(self.current_upload.picture_url)
+            
+            data = {
+                "upload" : {
+                    "title" : self.current_upload.title,
+                    "slug" : self.current_upload.slug,
+                    "description" : self.current_upload.description,
+                    "tag" : ["LarryViewer"],
+                    "files" : [i for i in self.current_upload.ids["file"] if i is not None]
+                    }
+                }
+            
+            if self.current_upload.ids["picture"]:
+                data["pic"] = self.current_upload.ids["picture"]
+            
+            r = requests.post(LARRY_API + "/uploads",
+                            headers = {"Content-Type" : "application/json", "Authorization": f"Bearer {self.credentials['token']}"},
+                            data = json.dumps(data))
+            
+            if r:
+                LarryViewer.displayMessageBox(self, "Upload erfolgreich!", "Upload")
+                return True
+            else:
+                LarryViewer.displayMessageBox(self, "Upload fehlgeschlagen!", "Fehler", QMessageBox.Critical)
+                return False
     
 if __name__ == "__main__":
+    if not HAVE_QT:
+        raise RuntimeError("Qt missing")
     QApplication.setOrganizationName("Fulgen")
     QApplication.setOrganizationDomain("https://github.com/Fulgen301")
     QApplication.setApplicationName("LarryViewer")
